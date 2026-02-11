@@ -17,41 +17,35 @@
 package org.apache.accumulo.test.functional;
 
 import static org.apache.accumulo.test.functional.BulkLoadTestUtils.addSplits;
-import static org.apache.accumulo.test.functional.BulkLoadTestUtils.verifyData;
-import static org.apache.accumulo.test.functional.BulkLoadTestUtils.verifyMetadata;
 import static org.apache.accumulo.test.functional.BulkLoadTestUtils.writeData;
+import static org.junit.Assert.fail;
 
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import java.io.FileNotFoundException;
 
 import org.apache.accumulo.core.client.Accumulo;
 import org.apache.accumulo.core.client.AccumuloClient;
+import org.apache.accumulo.core.client.AccumuloException;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
+import org.apache.accumulo.core.file.rfile.RFile;
 import org.apache.accumulo.harness.MiniClusterConfigurationCallback;
 import org.apache.accumulo.harness.SharedMiniClusterBase;
 import org.apache.accumulo.minicluster.MemoryUnit;
 import org.apache.accumulo.minicluster.ServerType;
 import org.apache.accumulo.miniclusterImpl.MiniAccumuloConfigImpl;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RawLocalFileSystem;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 /**
- * Tests new bulk import technique. If the old technique ever gets removed this will replace
- * {@link BulkFileIT}
- *
- * @since 2.0
+ * Tests new bulk import technique with bad permissions on the source files.
  */
-public class BulkLoadIT extends SharedMiniClusterBase {
+public class BulkLoadPermissionsIT extends SharedMiniClusterBase {
 
   @BeforeClass
   public static void setup() throws Exception {
@@ -67,8 +61,6 @@ public class BulkLoadIT extends SharedMiniClusterBase {
     @Override
     public void configureMiniCluster(MiniAccumuloConfigImpl cfg, Configuration conf) {
       cfg.setMemory(ServerType.TABLET_SERVER, 128 * 4, MemoryUnit.MEGABYTE);
-
-      // use raw local file system
       conf.set("fs.file.impl", RawLocalFileSystem.class.getName());
     }
   }
@@ -100,61 +92,39 @@ public class BulkLoadIT extends SharedMiniClusterBase {
     return dir;
   }
 
-  private void testBulkFile(boolean offline) throws Exception {
+  @Test
+  public void testBadPermissions() throws Exception {
     try (AccumuloClient c = Accumulo.newClient().from(getClientProps()).build()) {
-      addSplits(c, tableName, "0333 0666 0999 1333 1666");
+      addSplits(c, tableName, "0333");
 
-      if (offline)
-        c.tableOperations().offline(tableName);
+      String dir = getDir("/testBadPermissions-");
 
-      String dir = getDir("/testBulkFile-");
+      writeData(dir + "/f1.", fs, aconf, 0, 333);
 
-      Map<String,Set<String>> hashes = new HashMap<>();
-      for (String endRow : Arrays.asList("0333 0666 0999 1333 1666 null".split(" "))) {
-        hashes.put(endRow, new HashSet<>());
+      Path rFilePath = new Path(dir, "f1." + RFile.EXTENSION);
+      FsPermission originalPerms = fs.getFileStatus(rFilePath).getPermission();
+      fs.setPermission(rFilePath, FsPermission.valueOf("----------"));
+      try {
+        c.tableOperations().importDirectory(dir).to(tableName).load();
+      } catch (Exception e) {
+        Throwable cause = e.getCause();
+        if (!(cause instanceof FileNotFoundException)
+            && !(cause.getCause() instanceof FileNotFoundException))
+          fail("Expected FileNotFoundException but threw " + e.getCause());
+      } finally {
+        fs.setPermission(rFilePath, originalPerms);
       }
 
-      // Add a junk file, should be ignored
-      FSDataOutputStream out = fs.create(new Path(dir, "junk"));
-      out.writeChars("ABCDEFG\n");
-      out.close();
-
-      // 1 Tablet 0333-null
-      String h1 = writeData(dir + "/f1.", fs, aconf, 0, 333);
-      hashes.get("0333").add(h1);
-
-      // 2 Tablets 0666-0334, 0999-0667
-      String h2 = writeData(dir + "/f2.", fs, aconf, 334, 999);
-      hashes.get("0666").add(h2);
-      hashes.get("0999").add(h2);
-
-      // 2 Tablets 1333-1000, 1666-1334
-      String h3 = writeData(dir + "/f3.", fs, aconf, 1000, 1499);
-      hashes.get("1333").add(h3);
-      hashes.get("1666").add(h3);
-
-      // 2 Tablets 1666-1334, >1666
-      String h4 = writeData(dir + "/f4.", fs, aconf, 1500, 1999);
-      hashes.get("1666").add(h4);
-      hashes.get("null").add(h4);
-
-      c.tableOperations().importDirectory(dir).to(tableName).load();
-
-      if (offline)
-        c.tableOperations().online(tableName);
-
-      verifyData(c, tableName, 0, 1999, false);
-      verifyMetadata(c, tableName, hashes);
+      originalPerms = fs.getFileStatus(new Path(dir)).getPermission();
+      fs.setPermission(new Path(dir), FsPermission.valueOf("dr--r--r--"));
+      try {
+        c.tableOperations().importDirectory(dir).to(tableName).load();
+      } catch (AccumuloException ae) {
+        if (!(ae.getCause() instanceof FileNotFoundException))
+          fail("Expected FileNotFoundException but threw " + ae.getCause());
+      } finally {
+        fs.setPermission(new Path(dir), originalPerms);
+      }
     }
-  }
-
-  @Test
-  public void testBulkFile() throws Exception {
-    testBulkFile(false);
-  }
-
-  @Test
-  public void testBulkFileOffline() throws Exception {
-    testBulkFile(true);
   }
 }

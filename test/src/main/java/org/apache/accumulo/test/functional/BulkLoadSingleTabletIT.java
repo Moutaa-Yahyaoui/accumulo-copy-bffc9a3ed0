@@ -21,14 +21,10 @@ import static org.apache.accumulo.test.functional.BulkLoadTestUtils.verifyData;
 import static org.apache.accumulo.test.functional.BulkLoadTestUtils.verifyMetadata;
 import static org.apache.accumulo.test.functional.BulkLoadTestUtils.writeData;
 
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-
 import org.apache.accumulo.core.client.Accumulo;
 import org.apache.accumulo.core.client.AccumuloClient;
+import org.apache.accumulo.core.client.admin.NewTableConfiguration;
+import org.apache.accumulo.core.client.admin.TimeType;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
 import org.apache.accumulo.harness.MiniClusterConfigurationCallback;
 import org.apache.accumulo.harness.SharedMiniClusterBase;
@@ -36,7 +32,6 @@ import org.apache.accumulo.minicluster.MemoryUnit;
 import org.apache.accumulo.minicluster.ServerType;
 import org.apache.accumulo.miniclusterImpl.MiniAccumuloConfigImpl;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RawLocalFileSystem;
@@ -45,13 +40,13 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+
 /**
- * Tests new bulk import technique. If the old technique ever gets removed this will replace
- * {@link BulkFileIT}
- *
- * @since 2.0
+ * Tests new bulk import technique for single tablet tables.
  */
-public class BulkLoadIT extends SharedMiniClusterBase {
+public class BulkLoadSingleTabletIT extends SharedMiniClusterBase {
 
   @BeforeClass
   public static void setup() throws Exception {
@@ -67,8 +62,6 @@ public class BulkLoadIT extends SharedMiniClusterBase {
     @Override
     public void configureMiniCluster(MiniAccumuloConfigImpl cfg, Configuration conf) {
       cfg.setMemory(ServerType.TABLET_SERVER, 128 * 4, MemoryUnit.MEGABYTE);
-
-      // use raw local file system
       conf.set("fs.file.impl", RawLocalFileSystem.class.getName());
     }
   }
@@ -100,61 +93,81 @@ public class BulkLoadIT extends SharedMiniClusterBase {
     return dir;
   }
 
-  private void testBulkFile(boolean offline) throws Exception {
-    try (AccumuloClient c = Accumulo.newClient().from(getClientProps()).build()) {
-      addSplits(c, tableName, "0333 0666 0999 1333 1666");
+  private void testSingleTabletSingleFile(AccumuloClient c, boolean offline, boolean setTime)
+      throws Exception {
+    addSplits(c, tableName, "0333");
 
-      if (offline)
-        c.tableOperations().offline(tableName);
+    if (offline)
+      c.tableOperations().offline(tableName);
 
-      String dir = getDir("/testBulkFile-");
+    String dir = getDir("/testSingleTabletSingleFileNoSplits-");
 
-      Map<String,Set<String>> hashes = new HashMap<>();
-      for (String endRow : Arrays.asList("0333 0666 0999 1333 1666 null".split(" "))) {
-        hashes.put(endRow, new HashSet<>());
-      }
+    String h1 = writeData(dir + "/f1.", fs, aconf, 0, 332);
 
-      // Add a junk file, should be ignored
-      FSDataOutputStream out = fs.create(new Path(dir, "junk"));
-      out.writeChars("ABCDEFG\n");
-      out.close();
+    c.tableOperations().importDirectory(dir).to(tableName).tableTime(setTime).load();
 
-      // 1 Tablet 0333-null
-      String h1 = writeData(dir + "/f1.", fs, aconf, 0, 333);
-      hashes.get("0333").add(h1);
+    if (offline)
+      c.tableOperations().online(tableName);
 
-      // 2 Tablets 0666-0334, 0999-0667
-      String h2 = writeData(dir + "/f2.", fs, aconf, 334, 999);
-      hashes.get("0666").add(h2);
-      hashes.get("0999").add(h2);
+    verifyData(c, tableName, 0, 332, setTime);
+    verifyMetadata(c, tableName,
+        ImmutableMap.of("0333", ImmutableSet.of(h1), "null", ImmutableSet.of()));
+  }
 
-      // 2 Tablets 1333-1000, 1666-1334
-      String h3 = writeData(dir + "/f3.", fs, aconf, 1000, 1499);
-      hashes.get("1333").add(h3);
-      hashes.get("1666").add(h3);
-
-      // 2 Tablets 1666-1334, >1666
-      String h4 = writeData(dir + "/f4.", fs, aconf, 1500, 1999);
-      hashes.get("1666").add(h4);
-      hashes.get("null").add(h4);
-
-      c.tableOperations().importDirectory(dir).to(tableName).load();
-
-      if (offline)
-        c.tableOperations().online(tableName);
-
-      verifyData(c, tableName, 0, 1999, false);
-      verifyMetadata(c, tableName, hashes);
+  @Test
+  public void testSingleTabletSingleFile() throws Exception {
+    try (AccumuloClient client = Accumulo.newClient().from(getClientProps()).build()) {
+      testSingleTabletSingleFile(client, false, false);
     }
   }
 
   @Test
-  public void testBulkFile() throws Exception {
-    testBulkFile(false);
+  public void testSetTime() throws Exception {
+    try (AccumuloClient client = Accumulo.newClient().from(getClientProps()).build()) {
+      tableName = "testSetTime_table1";
+      NewTableConfiguration newTableConf = new NewTableConfiguration();
+      newTableConf.setTimeType(TimeType.LOGICAL);
+      client.tableOperations().create(tableName, newTableConf);
+      testSingleTabletSingleFile(client, false, true);
+    }
   }
 
   @Test
-  public void testBulkFileOffline() throws Exception {
-    testBulkFile(true);
+  public void testSingleTabletSingleFileOffline() throws Exception {
+    try (AccumuloClient client = Accumulo.newClient().from(getClientProps()).build()) {
+      testSingleTabletSingleFile(client, true, false);
+    }
+  }
+
+  private void testSingleTabletSingleFileNoSplits(AccumuloClient c, boolean offline)
+      throws Exception {
+    if (offline)
+      c.tableOperations().offline(tableName);
+
+    String dir = getDir("/testSingleTabletSingleFileNoSplits-");
+
+    String h1 = writeData(dir + "/f1.", fs, aconf, 0, 333);
+
+    c.tableOperations().importDirectory(dir).to(tableName).load();
+
+    if (offline)
+      c.tableOperations().online(tableName);
+
+    verifyData(c, tableName, 0, 333, false);
+    verifyMetadata(c, tableName, ImmutableMap.of("null", ImmutableSet.of(h1)));
+  }
+
+  @Test
+  public void testSingleTabletSingleFileNoSplits() throws Exception {
+    try (AccumuloClient client = Accumulo.newClient().from(getClientProps()).build()) {
+      testSingleTabletSingleFileNoSplits(client, false);
+    }
+  }
+
+  @Test
+  public void testSingleTabletSingleFileNoSplitsOffline() throws Exception {
+    try (AccumuloClient client = Accumulo.newClient().from(getClientProps()).build()) {
+      testSingleTabletSingleFileNoSplits(client, true);
+    }
   }
 }

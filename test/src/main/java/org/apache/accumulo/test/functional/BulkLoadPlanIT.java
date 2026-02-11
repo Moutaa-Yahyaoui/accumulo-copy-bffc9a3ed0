@@ -17,9 +17,11 @@
 package org.apache.accumulo.test.functional;
 
 import static org.apache.accumulo.test.functional.BulkLoadTestUtils.addSplits;
+import static org.apache.accumulo.test.functional.BulkLoadTestUtils.row;
 import static org.apache.accumulo.test.functional.BulkLoadTestUtils.verifyData;
 import static org.apache.accumulo.test.functional.BulkLoadTestUtils.verifyMetadata;
 import static org.apache.accumulo.test.functional.BulkLoadTestUtils.writeData;
+import static org.junit.Assert.fail;
 
 import java.util.Arrays;
 import java.util.HashMap;
@@ -29,7 +31,10 @@ import java.util.Set;
 
 import org.apache.accumulo.core.client.Accumulo;
 import org.apache.accumulo.core.client.AccumuloClient;
+import org.apache.accumulo.core.client.AccumuloException;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
+import org.apache.accumulo.core.data.LoadPlan;
+import org.apache.accumulo.core.data.LoadPlan.RangeType;
 import org.apache.accumulo.harness.MiniClusterConfigurationCallback;
 import org.apache.accumulo.harness.SharedMiniClusterBase;
 import org.apache.accumulo.minicluster.MemoryUnit;
@@ -45,13 +50,13 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+
 /**
- * Tests new bulk import technique. If the old technique ever gets removed this will replace
- * {@link BulkFileIT}
- *
- * @since 2.0
+ * Tests new bulk import technique using Load Plans.
  */
-public class BulkLoadIT extends SharedMiniClusterBase {
+public class BulkLoadPlanIT extends SharedMiniClusterBase {
 
   @BeforeClass
   public static void setup() throws Exception {
@@ -67,8 +72,6 @@ public class BulkLoadIT extends SharedMiniClusterBase {
     @Override
     public void configureMiniCluster(MiniAccumuloConfigImpl cfg, Configuration conf) {
       cfg.setMemory(ServerType.TABLET_SERVER, 128 * 4, MemoryUnit.MEGABYTE);
-
-      // use raw local file system
       conf.set("fs.file.impl", RawLocalFileSystem.class.getName());
     }
   }
@@ -100,7 +103,7 @@ public class BulkLoadIT extends SharedMiniClusterBase {
     return dir;
   }
 
-  private void testBulkFile(boolean offline) throws Exception {
+  private void testBulkFile(boolean offline, boolean usePlan) throws Exception {
     try (AccumuloClient c = Accumulo.newClient().from(getClientProps()).build()) {
       addSplits(c, tableName, "0333 0666 0999 1333 1666");
 
@@ -138,7 +141,15 @@ public class BulkLoadIT extends SharedMiniClusterBase {
       hashes.get("1666").add(h4);
       hashes.get("null").add(h4);
 
-      c.tableOperations().importDirectory(dir).to(tableName).load();
+      if (usePlan) {
+        LoadPlan loadPlan = LoadPlan.builder().loadFileTo("f1.rf", RangeType.TABLE, null, row(333))
+            .loadFileTo("f2.rf", RangeType.TABLE, row(333), row(999))
+            .loadFileTo("f3.rf", RangeType.FILE, row(1000), row(1499))
+            .loadFileTo("f4.rf", RangeType.FILE, row(1500), row(1999)).build();
+        c.tableOperations().importDirectory(dir).to(tableName).plan(loadPlan).load();
+      } else {
+        c.tableOperations().importDirectory(dir).to(tableName).load();
+      }
 
       if (offline)
         c.tableOperations().online(tableName);
@@ -149,12 +160,54 @@ public class BulkLoadIT extends SharedMiniClusterBase {
   }
 
   @Test
-  public void testBulkFile() throws Exception {
-    testBulkFile(false);
+  public void testLoadPlan() throws Exception {
+    testBulkFile(false, true);
   }
 
   @Test
-  public void testBulkFileOffline() throws Exception {
-    testBulkFile(true);
+  public void testLoadPlanOffline() throws Exception {
+    testBulkFile(true, true);
+  }
+
+  @Test
+  public void testBadLoadPlans() throws Exception {
+    try (AccumuloClient c = Accumulo.newClient().from(getClientProps()).build()) {
+      addSplits(c, tableName, "0333 0666 0999 1333 1666");
+
+      String dir = getDir("/testBulkFile-");
+
+      writeData(dir + "/f1.", fs, aconf, 0, 333);
+      writeData(dir + "/f2.", fs, aconf, 0, 666);
+
+      // Create a plan with more files than exists in dir
+      LoadPlan loadPlan = LoadPlan.builder().loadFileTo("f1.rf", RangeType.TABLE, null, row(333))
+          .loadFileTo("f2.rf", RangeType.TABLE, null, row(666))
+          .loadFileTo("f3.rf", RangeType.TABLE, null, row(666)).build();
+      try {
+        c.tableOperations().importDirectory(dir).to(tableName).plan(loadPlan).load();
+        fail();
+      } catch (IllegalArgumentException e) {
+        // ignore
+      }
+
+      // Create a plan with less files than exists in dir
+      loadPlan = LoadPlan.builder().loadFileTo("f1.rf", RangeType.TABLE, null, row(333)).build();
+      try {
+        c.tableOperations().importDirectory(dir).to(tableName).plan(loadPlan).load();
+        fail();
+      } catch (IllegalArgumentException e) {
+        // ignore
+      }
+
+      // Create a plan with tablet boundary that does not exits
+      loadPlan = LoadPlan.builder().loadFileTo("f1.rf", RangeType.TABLE, null, row(555))
+          .loadFileTo("f2.rf", RangeType.TABLE, null, row(555)).build();
+      try {
+        c.tableOperations().importDirectory(dir).to(tableName).plan(loadPlan).load();
+        fail();
+      } catch (AccumuloException e) {
+        // ignore
+      }
+    }
   }
 }
